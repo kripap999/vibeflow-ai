@@ -1,0 +1,15 @@
+flowchart TD
+    A[User Playlist Request] --> B[Request Parser]
+    B --> C[Structured Playlist Preferences]
+    C --> D[Journey Planner]
+    D --> E[Song Retriever]
+    E --> F[Constraint Filter]
+    F --> G[Song and Transition Scoring]
+    G --> H[Playlist Sequencer]
+    H --> I[Playlist Validator]
+    I -->|Issues found| J[Repair Agent]
+    J --> H
+    I -->|Validation passed| K[Explanation Generator]
+    K --> L[Final Playlist and Metrics]
+
+    
