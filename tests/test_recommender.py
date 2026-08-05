@@ -1,21 +1,26 @@
 """Tests for the music recommender.
 
-This file has two kinds of test.
+Two kinds of test live here.
 
-1. The two original starter tests, which exercise the OBJECT path
-   (Song / UserProfile / Recommender).
+1. The two original starter tests, which exercise the Recommender class.
 
-2. CHARACTERIZATION tests, added before refactoring. A characterization test
-   records what the code does *today*, not what it ideally should do. Its job is
-   to go red if a refactor accidentally changes behavior. Think of it as a net
-   under a trapeze: it does not make the trick better, it makes falling safe.
+2. CHARACTERIZATION tests, added before the dict/object consolidation. A
+   characterization test records what the code does *today*, not what it ideally
+   should do. Its job is to go red if a refactor accidentally changes behavior.
+   Think of it as a net under a trapeze: it does not make the trick better, it
+   makes falling safe.
 
-A few tests are explicitly marked KNOWN DEFECT. Those pin down behavior we have
-already agreed is wrong. We keep them so the bug is visible and documented, and
-so that when we fix it the test fails *on purpose* — telling us the change
-landed exactly where we intended.
+The numbers asserted below (6.84, 8.0, 3.94, 7.84, 2.0, 0.36) were captured from
+the dict-based implementation BEFORE the refactor and deliberately left
+unchanged afterwards. Only the way inputs are *constructed* changed. That is the
+proof the consolidation preserved behavior: same numbers, one code path.
+
+A few tests are marked KNOWN DEFECT. Those pin behavior we have already agreed
+is wrong. We keep them so the bug stays visible, and so that when we fix it the
+test fails *on purpose* — telling us the change landed where we intended.
 """
 
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
@@ -35,12 +40,17 @@ from src.recommender import (
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SONGS_CSV = str(REPO_ROOT / "data" / "songs.csv")
 
-# The four taste profiles used below mirror src/main.py, so the numbers asserted
-# here are the same numbers printed by the real application.
-POP_PROFILE = {"genre": "pop", "mood": "happy", "energy": 0.9}
-LOFI_PROFILE = {"genre": "lofi", "mood": "chill", "energy": 0.35, "likes_acoustic": True}
+# These mirror src/main.py, so the numbers asserted here are the same numbers
+# printed by the real application. Both deliberately leave some fields unset.
+POP_PROFILE = UserProfile(favorite_genre="pop", favorite_mood="happy", target_energy=0.9)
+LOFI_PROFILE = UserProfile(
+    favorite_genre="lofi",
+    favorite_mood="chill",
+    target_energy=0.35,
+    likes_acoustic=True,
+)
 
-EXPECTED_COLUMNS = {
+EXPECTED_FIELDS = {
     "id",
     "title",
     "artist",
@@ -88,28 +98,6 @@ def make_small_recommender() -> Recommender:
     return Recommender(songs)
 
 
-def song_from_row(row: dict) -> Song:
-    """Convert one dict from load_songs() into a Song object.
-
-    This bridge exists only so the equivalence tests below can feed the *same*
-    catalog row into both code paths. Its existence is itself the evidence that
-    we currently have two representations of a song. In the next refactor this
-    conversion moves into load_songs() and this helper disappears.
-    """
-    return Song(
-        id=row["id"],
-        title=row["title"],
-        artist=row["artist"],
-        genre=row["genre"],
-        mood=row["mood"],
-        energy=row["energy"],
-        tempo_bpm=row["tempo_bpm"],
-        valence=row["valence"],
-        danceability=row["danceability"],
-        acousticness=row["acousticness"],
-    )
-
-
 @pytest.fixture
 def catalog() -> list:
     """The real 19-song catalog, loaded once per test that asks for it."""
@@ -119,11 +107,11 @@ def catalog() -> list:
 @pytest.fixture
 def by_title(catalog) -> dict:
     """The catalog keyed by song title, for readable lookups in assertions."""
-    return {row["title"]: row for row in catalog}
+    return {song.title: song for song in catalog}
 
 
 # --------------------------------------------------------------------------
-# Original starter tests (object path)
+# Original starter tests
 # --------------------------------------------------------------------------
 
 def test_recommend_returns_songs_sorted_by_score():
@@ -166,36 +154,49 @@ def test_load_songs_reads_every_row(catalog):
     assert len(catalog) == 19
 
 
-def test_load_songs_returns_plain_dicts(catalog):
-    """Documents the current representation: dicts, not Song objects.
+def test_load_songs_returns_song_objects(catalog):
+    """The loader now produces the canonical Song model, not plain dicts.
 
-    This is the duplication we are about to remove. When load_songs starts
-    returning Song objects, THIS TEST SHOULD FAIL — that failure is the signal
-    that the refactor did what we wanted.
+    Before the refactor this test asserted `isinstance(row, dict)`. Flipping it
+    is the whole point of the consolidation: the application and the tests now
+    share one representation, so the `Song` dataclass is no longer reachable
+    only from test code.
     """
-    assert all(isinstance(row, dict) for row in catalog)
+    assert all(isinstance(song, Song) for song in catalog)
+
+
+def test_song_model_declares_every_expected_field():
+    """The dataclass itself now guarantees the schema.
+
+    Previously a test looped over all 19 rows checking each dict had the right
+    keys, because a dict can be missing anything. A Song cannot: omitting a
+    field raises TypeError at construction. So the check moves from "inspect the
+    data" to "inspect the model" — one assertion instead of nineteen.
+    """
+    assert {f.name for f in fields(Song)} == EXPECTED_FIELDS
 
 
 def test_load_songs_converts_text_to_numbers(by_title):
     """CSV files store everything as text; the loader must convert to numbers.
 
-    Without this, "0.82" stays a string and `abs(song - target)` would explode.
-    Note tempo_bpm becomes a float (118.0), not an int.
+    Without this, "0.82" stays a string and `abs(song.energy - target)` would
+    fail, because you cannot subtract a number from text. Note tempo_bpm becomes
+    a float (118.0), not an int.
     """
-    row = by_title["Sunrise City"]
+    song = by_title["Sunrise City"]
 
-    assert isinstance(row["id"], int)
-    assert row["id"] == 1
+    assert isinstance(song.id, int)
+    assert song.id == 1
 
-    for field in ("energy", "tempo_bpm", "valence", "danceability", "acousticness"):
-        assert isinstance(row[field], float), f"{field} should be a float"
+    for field_name in ("energy", "tempo_bpm", "valence", "danceability", "acousticness"):
+        assert isinstance(getattr(song, field_name), float), f"{field_name} should be a float"
 
-    assert row["energy"] == pytest.approx(0.82)
-    assert row["tempo_bpm"] == pytest.approx(118.0)
+    assert song.energy == pytest.approx(0.82)
+    assert song.tempo_bpm == pytest.approx(118.0)
 
     # Text fields stay text.
-    assert row["title"] == "Sunrise City"
-    assert row["artist"] == "Neon Echo"
+    assert song.title == "Sunrise City"
+    assert song.artist == "Neon Echo"
 
 
 def test_load_songs_preserves_csv_order(catalog):
@@ -204,24 +205,18 @@ def test_load_songs_preserves_csv_order(catalog):
     Python's sort is 'stable': items with equal scores keep their original
     relative order. So today the CSV order silently acts as our tie-breaker.
     """
-    assert catalog[0]["title"] == "Sunrise City"
-    assert catalog[-1]["title"] == "Dust Road Home"
-
-
-def test_load_songs_every_row_has_all_columns(catalog):
-    """Every song carries the full set of fields — no ragged rows."""
-    for row in catalog:
-        assert set(row.keys()) == EXPECTED_COLUMNS, f"bad columns in {row}"
+    assert catalog[0].title == "Sunrise City"
+    assert catalog[-1].title == "Dust Road Home"
 
 
 def test_catalog_ids_are_unique(catalog):
     """A data guard, not a characterization test.
 
-    Nothing in the code enforces unique IDs yet. This test asserts the data file
-    is currently clean, so if someone pastes in a duplicate ID while expanding
-    the catalog to 75+ tracks, we hear about it immediately.
+    Nothing in the code enforces unique IDs yet. This asserts the data file is
+    currently clean, so if someone pastes in a duplicate ID while expanding the
+    catalog to 75+ tracks, we hear about it immediately.
     """
-    ids = [row["id"] for row in catalog]
+    ids = [song.id for song in catalog]
     assert len(ids) == len(set(ids))
 
 
@@ -254,9 +249,9 @@ def test_score_song_matches_documented_pop_score(by_title):
 def test_score_song_partial_match_scores_lower(by_title):
     """'Gym Hero' matches genre and energy but NOT mood, so it scores 3.94.
 
-    This is the case your model card calls out: a pop song with the wrong mood
+    This is the case the model card calls out: a pop song with the wrong mood
     still ranks well because two of three signals agree. Worth pinning, because
-    it is the behavior we may deliberately change later.
+    it is behavior we may deliberately change later.
     """
     score, _ = score_song(POP_PROFILE, by_title["Gym Hero"])
     assert score == pytest.approx(3.94)
@@ -276,30 +271,57 @@ def test_score_song_returns_one_reason_per_awarded_component(by_title):
     assert any("energy 0.82 near target 0.9" in r for r in reasons)
 
 
-def test_score_song_with_no_preferences_scores_zero(by_title):
-    """No stated preferences means no points and no reasons.
+def test_score_song_with_no_stated_preferences_scores_zero(by_title):
+    """An empty profile means no points and no reasons.
 
-    Every scoring rule is guarded by `if "..." in user_prefs`, so an empty
-    profile skips all of them rather than crashing.
+    Every scoring rule is guarded by `is not None`, so a profile that states
+    nothing skips all of them rather than crashing.
     """
-    score, reasons = score_song({}, by_title["Sunrise City"])
+    score, reasons = score_song(UserProfile(), by_title["Sunrise City"])
 
     assert score == 0.0
     assert reasons == []
 
 
-def test_score_song_ignores_missing_preference_keys(by_title):
-    """Asking about genre alone must not require the other keys to be present."""
-    score, reasons = score_song({"genre": "pop"}, by_title["Sunrise City"])
+def test_score_song_skips_unstated_preferences(by_title):
+    """Stating genre alone must not require the other fields to be set."""
+    score, reasons = score_song(UserProfile(favorite_genre="pop"), by_title["Sunrise City"])
 
     assert score == pytest.approx(2.0)
     assert len(reasons) == 1
 
 
+def test_unstated_preference_is_not_the_same_as_stating_false(by_title):
+    """The distinction that makes this refactor behavior-preserving.
+
+    'Sunrise City' is not acoustic (acousticness 0.18). A listener who says
+    nothing about acoustics gets no acoustic points. A listener who explicitly
+    says likes_acoustic=False *agrees* with the song and earns +1.0.
+
+    Collapsing None into False would have raised every score in the application
+    by 1.0 and invalidated the numbers in the README and model card.
+    """
+    song = by_title["Sunrise City"]
+
+    unstated, _ = score_song(POP_PROFILE, song)
+    stated_false, _ = score_song(
+        UserProfile(
+            favorite_genre="pop",
+            favorite_mood="happy",
+            target_energy=0.9,
+            likes_acoustic=False,
+        ),
+        song,
+    )
+
+    assert unstated == pytest.approx(6.84)
+    assert stated_false == pytest.approx(7.84)
+
+
 def test_score_song_energy_reward_is_graded_not_all_or_nothing(by_title):
     """Energy is scored by CLOSENESS, so it pays out on a sliding scale.
 
-    Exact match  -> the full 2.0
+    Exact match     -> the full 2.0
     Far from target -> a small fraction
 
     This is the most important idea in the current scorer and the one that
@@ -308,8 +330,8 @@ def test_score_song_energy_reward_is_graded_not_all_or_nothing(by_title):
     """
     song = by_title["Sunrise City"]  # energy 0.82
 
-    exact, _ = score_song({"energy": 0.82}, song)
-    far, _ = score_song({"energy": 0.0}, song)
+    exact, _ = score_song(UserProfile(target_energy=0.82), song)
+    far, _ = score_song(UserProfile(target_energy=0.0), song)
 
     assert exact == pytest.approx(2.0)
     assert far == pytest.approx(0.36)  # 2.0 * (1 - 0.82)
@@ -326,10 +348,10 @@ def test_score_song_acoustic_preference_rewards_agreement_both_ways(by_title):
     electronic = by_title["Sunrise City"]  # acousticness 0.18 -> not acoustic
     acoustic = by_title["Library Rain"]  # acousticness 0.86 -> acoustic
 
-    assert score_song({"likes_acoustic": False}, electronic)[0] == pytest.approx(1.0)
-    assert score_song({"likes_acoustic": True}, electronic)[0] == pytest.approx(0.0)
-    assert score_song({"likes_acoustic": True}, acoustic)[0] == pytest.approx(1.0)
-    assert score_song({"likes_acoustic": False}, acoustic)[0] == pytest.approx(0.0)
+    assert score_song(UserProfile(likes_acoustic=False), electronic)[0] == pytest.approx(1.0)
+    assert score_song(UserProfile(likes_acoustic=True), electronic)[0] == pytest.approx(0.0)
+    assert score_song(UserProfile(likes_acoustic=True), acoustic)[0] == pytest.approx(1.0)
+    assert score_song(UserProfile(likes_acoustic=False), acoustic)[0] == pytest.approx(0.0)
 
 
 def test_score_song_currently_allows_negative_scores_KNOWN_DEFECT():
@@ -340,10 +362,26 @@ def test_score_song_currently_allows_negative_scores_KNOWN_DEFECT():
     the malformed explanation text '(+-8.00)'. No exception is raised, so a
     single CSV typo would corrupt rankings silently.
 
+    Note that the Song dataclass happily accepts energy=5.0: type hints are
+    documentation, not enforcement. Python does not validate them at runtime.
+
     We pin it here so the bug is documented. When we add validation, this test
     should be REPLACED by one asserting a clear error is raised.
     """
-    score, reasons = score_song({"energy": 0.0}, {"energy": 5.0})
+    broken = Song(
+        id=999,
+        title="Out Of Range",
+        artist="Bad Data",
+        genre="pop",
+        mood="happy",
+        energy=5.0,
+        tempo_bpm=120.0,
+        valence=0.5,
+        danceability=0.5,
+        acousticness=0.5,
+    )
+
+    score, reasons = score_song(UserProfile(target_energy=0.0), broken)
 
     assert score == pytest.approx(-8.0)
     assert "(+-8.00)" in reasons[0]
@@ -359,7 +397,7 @@ def test_recommend_songs_returns_exactly_k_results(catalog):
 
 
 def test_recommend_songs_returns_song_score_explanation_triples(catalog):
-    """Documents the return SHAPE: a 3-tuple of (dict, float, str).
+    """Documents the return SHAPE: a 3-tuple of (Song, float, str).
 
     src/main.py unpacks exactly this shape, so anything that changes it breaks
     the application.
@@ -367,7 +405,7 @@ def test_recommend_songs_returns_song_score_explanation_triples(catalog):
     results = recommend_songs(POP_PROFILE, catalog, k=3)
 
     for song, score, explanation in results:
-        assert isinstance(song, dict)
+        assert isinstance(song, Song)
         assert isinstance(score, float)
         assert isinstance(explanation, str)
         assert explanation.strip() != ""
@@ -386,7 +424,7 @@ def test_recommend_songs_sorts_highest_score_first(catalog):
 
 def test_recommend_songs_top_pick_for_pop_profile(catalog):
     """Pins the actual top 3 the application prints today."""
-    titles = [song["title"] for song, _, _ in recommend_songs(POP_PROFILE, catalog, k=3)]
+    titles = [song.title for song, _, _ in recommend_songs(POP_PROFILE, catalog, k=3)]
 
     assert titles == ["Sunrise City", "Rooftop Lights", "Gym Hero"]
 
@@ -394,26 +432,26 @@ def test_recommend_songs_top_pick_for_pop_profile(catalog):
 def test_recommend_songs_does_not_modify_the_catalog(catalog):
     """Ranking must not reorder or damage the caller's list.
 
-    recommend_songs builds a new list and sorts that, leaving the input alone.
-    A function that quietly rearranges its argument causes bugs that are very
-    hard to trace, so this is worth locking down.
+    recommend_songs builds a new list and sorts that, leaving the input alone. A
+    function that quietly rearranges its argument causes bugs that are very hard
+    to trace, so this is worth locking down.
     """
-    before = [row["title"] for row in catalog]
+    before = [song.title for song in catalog]
 
     recommend_songs(POP_PROFILE, catalog, k=5)
 
-    assert [row["title"] for row in catalog] == before
+    assert [song.title for song in catalog] == before
 
 
 def test_recommend_songs_explanation_matches_score_reasons(catalog, by_title):
-    """The printed explanation is the scorer's reasons joined by '; '.
+    """The displayed explanation is the scorer's reasons joined by '; '.
 
     Confirms nothing is added or dropped between scoring and display.
     """
     results = recommend_songs(POP_PROFILE, catalog, k=1)
     song, _, explanation = results[0]
 
-    _, reasons = score_song(POP_PROFILE, by_title[song["title"]])
+    _, reasons = score_song(POP_PROFILE, by_title[song.title])
     assert explanation == "; ".join(reasons)
 
 
@@ -432,30 +470,29 @@ def test_ties_are_currently_broken_by_float_noise_KNOWN_DEFECT(catalog):
     Reproducible, but arbitrary. When we add real tie-breaking rules this test
     should fail and be replaced.
     """
-    rock_profile = {"genre": "rock", "mood": "intense", "energy": 0.9}
+    rock_profile = UserProfile(
+        favorite_genre="rock", favorite_mood="intense", target_energy=0.9
+    )
     ranked = recommend_songs(rock_profile, catalog, k=19)
-    titles = [song["title"] for song, _, _ in ranked]
+    titles = [song.title for song, _, _ in ranked]
 
     assert titles.index("Iron Verdict") < titles.index("Sunrise City")
 
 
 # --------------------------------------------------------------------------
-# Equivalence: the two code paths must agree
+# One code path: the Recommender is now a thin facade
 # --------------------------------------------------------------------------
 
-def test_dict_path_and_object_path_give_identical_scores(by_title):
-    """THE KEY TEST OF THIS STEP.
+def test_score_song_consumes_song_objects_directly(by_title):
+    """THE POINT OF THIS REFACTOR.
 
-    The application scores dicts via score_song. The tests score Song objects
-    via Recommender._score. Both must produce the same number for the same song.
+    Before, this test fed the same catalog row through two paths — score_song on
+    a dict, and Recommender._score on a Song — and asserted they agreed at 7.84.
 
-    This is what makes the coming consolidation provably behavior-preserving: if
-    the two paths agree now, and still agree after we delete one of them, then
-    we removed duplication without changing results.
+    That adapter is now deleted. score_song takes a Song directly, so there is
+    nothing left to disagree. The number is unchanged, which is the evidence
+    that removing the duplication did not change results.
     """
-    row = by_title["Sunrise City"]
-
-    prefs = {"genre": "pop", "mood": "happy", "energy": 0.9, "likes_acoustic": False}
     user = UserProfile(
         favorite_genre="pop",
         favorite_mood="happy",
@@ -463,22 +500,19 @@ def test_dict_path_and_object_path_give_identical_scores(by_title):
         likes_acoustic=False,
     )
 
-    dict_score, dict_reasons = score_song(prefs, row)
-    object_score, object_reasons = Recommender([])._score(user, song_from_row(row))
+    score, reasons = score_song(user, by_title["Sunrise City"])
 
-    assert dict_score == pytest.approx(object_score)
-    assert dict_reasons == object_reasons
-    assert dict_score == pytest.approx(7.84)
+    assert score == pytest.approx(7.84)
+    assert len(reasons) == 4
 
 
-def test_both_paths_rank_the_full_catalog_identically(catalog):
-    """The two RANKERS must also agree, not just the two scorers.
+def test_recommender_delegates_to_recommend_songs(catalog):
+    """Recommender.recommend must be a pass-through, not a second ranker.
 
-    recommend_songs and Recommender.recommend are separate implementations of
-    'sort by score and take the top k'. Pinning that they produce the same order
-    over all 19 real songs is what protects us when we collapse them into one.
+    It previously ran its own `sorted(...)` call. Now it forwards to
+    recommend_songs and drops the scores. Asserting both produce the same order
+    over all 19 real songs is what proves the delegation is faithful.
     """
-    prefs = {"genre": "pop", "mood": "happy", "energy": 0.9, "likes_acoustic": False}
     user = UserProfile(
         favorite_genre="pop",
         favorite_mood="happy",
@@ -486,16 +520,14 @@ def test_both_paths_rank_the_full_catalog_identically(catalog):
         likes_acoustic=False,
     )
 
-    dict_titles = [song["title"] for song, _, _ in recommend_songs(prefs, catalog, k=5)]
+    function_titles = [song.title for song, _, _ in recommend_songs(user, catalog, k=5)]
+    class_titles = [song.title for song in Recommender(catalog).recommend(user, k=5)]
 
-    songs = [song_from_row(row) for row in catalog]
-    object_titles = [song.title for song in Recommender(songs).recommend(user, k=5)]
-
-    assert dict_titles == object_titles
+    assert function_titles == class_titles
 
 
 def test_explain_recommendation_adds_a_score_prefix(by_title):
-    """Documents the one real difference between the two paths.
+    """Documents the one remaining difference between the two entry points.
 
     recommend_songs returns only the joined reasons:
         "mood match: happy (+3.0); genre match: pop (+2.0); ..."
@@ -503,8 +535,8 @@ def test_explain_recommendation_adds_a_score_prefix(by_title):
     Recommender.explain_recommendation prepends the total:
         "Score 7.84 — mood match: happy (+3.0); ..."
 
-    Two explanation formats for the same facts. Pinned here so we choose one
-    deliberately during consolidation instead of losing one by accident.
+    Both read the same reasons from the same scorer, so the facts cannot drift.
+    Only the presentation differs.
     """
     user = UserProfile(
         favorite_genre="pop",
@@ -512,7 +544,7 @@ def test_explain_recommendation_adds_a_score_prefix(by_title):
         target_energy=0.9,
         likes_acoustic=False,
     )
-    song = song_from_row(by_title["Sunrise City"])
+    song = by_title["Sunrise City"]
 
     explanation = Recommender([song]).explain_recommendation(user, song)
 
