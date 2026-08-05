@@ -20,13 +20,15 @@ is wrong. We keep them so the bug stays visible, and so that when we fix it the
 test fails *on purpose* — telling us the change landed where we intended.
 """
 
-from dataclasses import fields
+from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 
 import pytest
 
 from src.recommender import (
+    DEFAULT_WEIGHTS,
     Recommender,
+    ScoringWeights,
     Song,
     UserProfile,
     load_songs,
@@ -550,3 +552,140 @@ def test_explain_recommendation_adds_a_score_prefix(by_title):
 
     assert explanation.startswith("Score 7.84 — ")
     assert "mood match: happy (+3.0)" in explanation
+
+
+# --------------------------------------------------------------------------
+# ScoringWeights: the weighting is now configuration, not code
+# --------------------------------------------------------------------------
+
+def test_default_weights_match_the_original_hard_coded_values():
+    """The defaults must reproduce the numbers that used to be literals.
+
+    This is what makes introducing ScoringWeights behavior-preserving. If anyone
+    changes a default, every documented score in README.md and model_card.md
+    becomes wrong — so the defaults are pinned here explicitly.
+    """
+    assert DEFAULT_WEIGHTS.mood_match == pytest.approx(3.0)
+    assert DEFAULT_WEIGHTS.genre_match == pytest.approx(2.0)
+    assert DEFAULT_WEIGHTS.energy_match == pytest.approx(2.0)
+    assert DEFAULT_WEIGHTS.acoustic_match == pytest.approx(1.0)
+    assert DEFAULT_WEIGHTS.acoustic_threshold == pytest.approx(0.5)
+
+
+def test_scoring_weights_cannot_be_modified():
+    """ScoringWeights is frozen, so a weighting cannot change mid-run.
+
+    This is also what makes DEFAULT_WEIGHTS safe as a default argument. The
+    classic Python trap is a mutable default like `def f(items=[])`: every call
+    shares one object, so a change made by one caller leaks into the next.
+    A frozen dataclass raises instead of mutating.
+    """
+    weights = ScoringWeights()
+
+    with pytest.raises(FrozenInstanceError):
+        weights.mood_match = 99.0
+
+
+def test_custom_weights_change_the_score(by_title):
+    """Passing different weights produces a different total.
+
+    Doubling the mood weight from 3.0 to 6.0 should add exactly 3.0 to a song
+    that matches on mood: 6.84 becomes 9.84.
+    """
+    song = by_title["Sunrise City"]
+
+    default_score, _ = score_song(POP_PROFILE, song)
+    louder_mood, _ = score_song(POP_PROFILE, song, ScoringWeights(mood_match=6.0))
+
+    assert default_score == pytest.approx(6.84)
+    assert louder_mood == pytest.approx(9.84)
+
+
+def test_zero_weights_score_nothing(by_title):
+    """A weighting of all zeros scores every song at 0.0.
+
+    Useful as a sanity check that no points are awarded from anywhere except the
+    weights — no stray literal is hiding in the scorer.
+    """
+    silent = ScoringWeights(
+        mood_match=0.0, genre_match=0.0, energy_match=0.0, acoustic_match=0.0
+    )
+
+    score, reasons = score_song(LOFI_PROFILE, by_title["Library Rain"], silent)
+
+    assert score == pytest.approx(0.0)
+    # Reasons are still produced — the rules matched, they were just worth nothing.
+    assert len(reasons) == 4
+
+
+def test_explanation_reports_the_weight_actually_used(by_title):
+    """Grounded explanations: the text must quote the real weight, not '3.0'.
+
+    The reason strings used to hard-code '(+3.0)' as literal text. If a weight
+    changed, the explanation would have lied about how many points were awarded.
+    Now the number is read from the weights, so text and arithmetic cannot drift.
+    """
+    song = by_title["Sunrise City"]
+
+    _, reasons = score_song(POP_PROFILE, song, ScoringWeights(mood_match=5.0))
+
+    assert "mood match: happy (+5.0)" in reasons
+    assert "mood match: happy (+3.0)" not in reasons
+
+
+def test_acoustic_threshold_is_configurable(by_title):
+    """The '> 0.5' acousticness cutoff is a tuning knob, not a law of nature.
+
+    'Sunrise City' has acousticness 0.18. Under the default 0.5 threshold it is
+    not acoustic. Drop the threshold to 0.1 and it counts as acoustic, which
+    flips which preference it agrees with.
+    """
+    song = by_title["Sunrise City"]
+    wants_acoustic = UserProfile(likes_acoustic=True)
+
+    assert score_song(wants_acoustic, song)[0] == pytest.approx(0.0)
+
+    lenient = ScoringWeights(acoustic_threshold=0.1)
+    assert score_song(wants_acoustic, song, lenient)[0] == pytest.approx(1.0)
+
+
+def test_weights_flow_through_the_recommender_class(catalog):
+    """The facade must honour its configured weights, not silently use defaults."""
+    loud_mood = ScoringWeights(mood_match=6.0)
+    rec = Recommender(catalog, weights=loud_mood)
+
+    explanation = rec.explain_recommendation(POP_PROFILE, catalog[0])
+
+    assert "mood match: happy (+6.0)" in explanation
+    assert explanation.startswith("Score 9.84 — ")
+
+
+def test_model_card_weight_experiment_changes_scores_but_not_order(catalog):
+    """Reproduces the weight experiment documented in model_card.md section 7.
+
+    The model card reports setting energy to 4.0 and genre to 1.0, and concludes:
+    the #1 pick stayed the same for every profile, but "mid-list rankings
+    (positions 3-5) became energy-driven and genre matches barely mattered."
+
+    The first half is correct. The second half is NOT: with this catalog the
+    experiment changes no positions at all — not the top 5, not any of the 19.
+    Scores move a lot (Sunrise City 6.84 -> 7.68) while the ORDER is identical,
+    because doubling the energy weight scales every song's energy term by the
+    same factor, and the score gaps are wide enough that halving the genre bonus
+    never flips an adjacent pair.
+
+    This test exists to keep the documented claim honest. The model card should
+    be corrected to say the ranking was unchanged.
+    """
+    experiment = ScoringWeights(energy_match=4.0, genre_match=1.0)
+
+    default_order = [s.title for s, _, _ in recommend_songs(POP_PROFILE, catalog, 19)]
+    experiment_order = [
+        s.title for s, _, _ in recommend_songs(POP_PROFILE, catalog, 19, experiment)
+    ]
+    assert default_order == experiment_order
+
+    default_top, _ = score_song(POP_PROFILE, catalog[0])
+    experiment_top, _ = score_song(POP_PROFILE, catalog[0], experiment)
+    assert default_top == pytest.approx(6.84)
+    assert experiment_top == pytest.approx(7.68)

@@ -72,6 +72,51 @@ class UserProfile:
     likes_acoustic: Optional[bool] = None
 
 
+@dataclass(frozen=True)
+class ScoringWeights:
+    """How much each feature contributes to a song's score.
+
+    These numbers were previously literals buried inside `score_song`, which
+    meant the only way to try different priorities was to edit the source and
+    edit it back. Pulling them out makes a weighting into a value you can name,
+    pass around, compare against another, and assert on in a test.
+
+    The defaults reproduce the original hard-coded behavior exactly, so existing
+    scores are unchanged.
+
+        mood_match     awarded when the song's mood equals the stated mood
+        genre_match    awarded when the song's genre equals the stated genre
+        energy_match   the MAXIMUM awarded for energy; the actual award is this
+                       value scaled by how close the song is to the target, so a
+                       dead-on match earns all of it and a distant song earns
+                       almost none
+        acoustic_match awarded when the song agrees with the acoustic preference
+
+    `acoustic_threshold` is not a weight — it is the cutoff above which a song
+    counts as "acoustic". It lives here because it is the same kind of thing: a
+    tuning knob that used to be an unexplained literal (`> 0.5`). Keeping the
+    class named ScoringWeights and documenting the exception is clearer than
+    inventing a second config object for one value.
+
+    Frozen (immutable) on purpose. A weighting should not change halfway through
+    a run, and immutability is what makes it safe to use as a default argument.
+    """
+
+    mood_match: float = 3.0
+    genre_match: float = 2.0
+    energy_match: float = 2.0
+    acoustic_match: float = 1.0
+    acoustic_threshold: float = 0.5
+
+
+# The default weighting, matching the original hard-coded values. Safe to use as
+# a default argument precisely BECAUSE ScoringWeights is frozen: the classic
+# Python trap is a mutable default like `def f(items=[])`, where every call
+# shares one list and changes leak between calls. A frozen dataclass cannot be
+# modified, so every caller sees the same unchanging values.
+DEFAULT_WEIGHTS = ScoringWeights()
+
+
 def load_songs(csv_path: str) -> List[Song]:
     """Read the song catalog from a CSV file into a list of Song objects.
 
@@ -106,12 +151,15 @@ def load_songs(csv_path: str) -> List[Song]:
     return songs
 
 
-def score_song(user: UserProfile, song: Song) -> Tuple[float, List[str]]:
+def score_song(
+    user: UserProfile, song: Song, weights: ScoringWeights = DEFAULT_WEIGHTS
+) -> Tuple[float, List[str]]:
     """Score one song against one listener profile.
 
     Returns the total score and a list of human-readable reasons. Every reason
     corresponds to points actually awarded, so an explanation can never claim
-    something the scorer did not do.
+    something the scorer did not do — including the amount, which is read from
+    `weights` rather than written into the text.
 
     The recipe uses three different kinds of comparison:
 
@@ -119,25 +167,28 @@ def score_song(user: UserProfile, song: Song) -> Tuple[float, List[str]]:
         energy        graded by closeness to the target, on a sliding scale
         acoustic      a continuous value thresholded into yes/no, then compared
 
-    Maximum possible score is 8.0 (3.0 + 2.0 + 2.0 + 1.0), reachable only when
-    the listener states all four preferences and the song matches all of them.
+    `weights` defaults to DEFAULT_WEIGHTS, so callers that do not care about
+    tuning can ignore it entirely. With the defaults the maximum score is 8.0
+    (3.0 + 2.0 + 2.0 + 1.0), reachable only when the listener states all four
+    preferences and the song matches all of them.
     """
     score = 0.0
     reasons: List[str] = []
 
-    # Categorical matches: an exact string match earns fixed points.
+    # Categorical matches: an exact string match earns the full weight.
     if user.favorite_mood is not None and song.mood == user.favorite_mood:
-        score += 3.0
-        reasons.append(f"mood match: {song.mood} (+3.0)")
+        score += weights.mood_match
+        reasons.append(f"mood match: {song.mood} (+{weights.mood_match:.1f})")
     if user.favorite_genre is not None and song.genre == user.favorite_genre:
-        score += 2.0
-        reasons.append(f"genre match: {song.genre} (+2.0)")
+        score += weights.genre_match
+        reasons.append(f"genre match: {song.genre} (+{weights.genre_match:.1f})")
 
     # Numeric closeness: reward songs whose energy is NEAR the target, not just
-    # high. Both values sit in 0.0-1.0, so closeness lands in 0.0-1.0 too.
+    # high. Both values sit in 0.0-1.0, so closeness lands in 0.0-1.0 too, and
+    # the award is the full energy weight scaled by that closeness.
     if user.target_energy is not None:
         closeness = 1 - abs(song.energy - user.target_energy)
-        points = 2.0 * closeness
+        points = weights.energy_match * closeness
         score += points
         reasons.append(
             f"energy {song.energy} near target {user.target_energy} (+{points:.2f})"
@@ -145,16 +196,21 @@ def score_song(user: UserProfile, song: Song) -> Tuple[float, List[str]]:
 
     # Optional acoustic preference: rewards agreement, either direction.
     if user.likes_acoustic is not None:
-        is_acoustic = song.acousticness > 0.5
+        is_acoustic = song.acousticness > weights.acoustic_threshold
         if is_acoustic == user.likes_acoustic:
-            score += 1.0
-            reasons.append("acoustic preference match (+1.0)")
+            score += weights.acoustic_match
+            reasons.append(
+                f"acoustic preference match (+{weights.acoustic_match:.1f})"
+            )
 
     return score, reasons
 
 
 def recommend_songs(
-    user: UserProfile, songs: List[Song], k: int = 5
+    user: UserProfile,
+    songs: List[Song],
+    k: int = 5,
+    weights: ScoringWeights = DEFAULT_WEIGHTS,
 ) -> List[Tuple[Song, float, str]]:
     """Score every song, then return the top k as (song, score, explanation).
 
@@ -167,7 +223,7 @@ def recommend_songs(
     """
     scored: List[Tuple[Song, float, str]] = []
     for song in songs:
-        score, reasons = score_song(user, song)
+        score, reasons = score_song(user, song, weights)
         explanation = "; ".join(reasons) if reasons else "no strong matches"
         scored.append((song, score, explanation))
 
@@ -186,15 +242,17 @@ class Recommender:
     for deletion.
     """
 
-    def __init__(self, songs: List[Song]):
+    def __init__(self, songs: List[Song], weights: ScoringWeights = DEFAULT_WEIGHTS):
         self.songs = songs
+        self.weights = weights
 
     def recommend(self, user: UserProfile, k: int = 5) -> List[Song]:
         """Return the top k Songs for this user, ranked highest score first."""
-        return [song for song, _score, _explanation in recommend_songs(user, self.songs, k)]
+        ranked = recommend_songs(user, self.songs, k, self.weights)
+        return [song for song, _score, _explanation in ranked]
 
     def explain_recommendation(self, user: UserProfile, song: Song) -> str:
         """Return a human-readable string explaining a song's score."""
-        score, reasons = score_song(user, song)
+        score, reasons = score_song(user, song, self.weights)
         detail = "; ".join(reasons) if reasons else "no strong matches"
         return f"Score {score:.2f} — {detail}"
