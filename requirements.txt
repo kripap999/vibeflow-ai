@@ -1,3 +1,8 @@
-pandas
-pytest
-streamlit
+# The recommender itself uses only the Python standard library
+# (csv, dataclasses, typing), so it has no third-party runtime dependency yet.
+
+# Testing
+pytest>=8.0
+
+# Web interface. Listed for the upcoming Streamlit app; no code imports it yet.
+streamlit>=1.30
