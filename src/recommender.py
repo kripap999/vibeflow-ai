@@ -14,7 +14,29 @@ scoring could never use them without edits in two places. It is now gone.
 
 import csv
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
+
+from src.exceptions import CatalogError, InvalidSongError
+
+# Columns the CSV must provide. Extra columns are ignored, which lets the data
+# file carry notes without breaking the loader.
+REQUIRED_COLUMNS = (
+    "id",
+    "title",
+    "artist",
+    "genre",
+    "mood",
+    "energy",
+    "tempo_bpm",
+    "valence",
+    "danceability",
+    "acousticness",
+)
+
+# Fields that describe a proportion and must therefore sit inside 0.0-1.0.
+# The scoring formula 2.0 * (1 - abs(a - b)) only behaves for values in this
+# range; outside it, scores go negative and rankings become nonsense.
+UNIT_RANGE_FIELDS = ("energy", "valence", "danceability", "acousticness")
 
 
 @dataclass
@@ -49,6 +71,46 @@ class Song:
     danceability: float
     acousticness: float
 
+    def __post_init__(self) -> None:
+        """Validate this song's own invariants the moment it is constructed.
+
+        `__post_init__` is a dataclass hook: it runs automatically right after
+        the generated `__init__` has assigned the fields. Putting the checks here
+        means a Song that breaks its own rules cannot exist at all — not from a
+        CSV, not from test code, not from a future LLM-generated suggestion.
+
+        This is the "make illegal states unrepresentable" idea. Validating only
+        at the CSV boundary would still allow Song(energy=5.0) in code, and the
+        scoring formula would silently return a negative score for it.
+
+        Type hints do NOT do this for us. Python does not check annotations at
+        runtime, so `energy: float` happily accepts the string "loud".
+        """
+        problems: List[str] = []
+
+        if not isinstance(self.id, int) or isinstance(self.id, bool):
+            problems.append(f"id must be a whole number, got {self.id!r}")
+
+        for field_name in ("title", "artist", "genre", "mood"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                problems.append(f"{field_name} must be a non-empty string, got {value!r}")
+
+        for field_name in UNIT_RANGE_FIELDS:
+            value = getattr(self, field_name)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                problems.append(f"{field_name} must be a number, got {value!r}")
+            elif not 0.0 <= value <= 1.0:
+                problems.append(f"{field_name} must be between 0.0 and 1.0, got {value}")
+
+        if not isinstance(self.tempo_bpm, (int, float)) or isinstance(self.tempo_bpm, bool):
+            problems.append(f"tempo_bpm must be a number, got {self.tempo_bpm!r}")
+        elif self.tempo_bpm <= 0:
+            problems.append(f"tempo_bpm must be greater than 0, got {self.tempo_bpm}")
+
+        if problems:
+            raise InvalidSongError("; ".join(problems))
+
 
 @dataclass
 class UserProfile:
@@ -70,6 +132,27 @@ class UserProfile:
     favorite_mood: Optional[str] = None
     target_energy: Optional[float] = None
     likes_acoustic: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        """Reject a target energy outside 0.0-1.0.
+
+        Validating songs alone would not fully close the negative-score hole,
+        because the energy term compares a song against a *target*. A target of
+        5.0 against a valid song still yields 2.0 * (1 - 4.5) = -7.0. Both sides
+        of the comparison have to be in range for the formula to mean anything.
+        """
+        if self.target_energy is None:
+            return
+        if isinstance(self.target_energy, bool) or not isinstance(
+            self.target_energy, (int, float)
+        ):
+            raise InvalidSongError(
+                f"target_energy must be a number, got {self.target_energy!r}"
+            )
+        if not 0.0 <= self.target_energy <= 1.0:
+            raise InvalidSongError(
+                f"target_energy must be between 0.0 and 1.0, got {self.target_energy}"
+            )
 
 
 @dataclass(frozen=True)
@@ -117,38 +200,115 @@ class ScoringWeights:
 DEFAULT_WEIGHTS = ScoringWeights()
 
 
+def _to_number(raw: str, field: str, whole: bool = False) -> float:
+    """Convert one CSV text value to a number, or explain why it cannot be.
+
+    `float("loud")` raises a bare `ValueError: could not convert string to float:
+    'loud'`, which does not say WHICH column was wrong. Wrapping it lets us name
+    the field, which is the difference between an error you can act on and one
+    you have to go hunting for.
+    """
+    try:
+        return int(raw) if whole else float(raw)
+    except (TypeError, ValueError):
+        kind = "whole number" if whole else "number"
+        raise InvalidSongError(f"{field} must be a {kind}, got {raw!r}") from None
+
+
+def _song_from_row(row: Dict[str, str]) -> Song:
+    """Build one Song from one CSV row, converting text to numbers.
+
+    Range and emptiness checks are NOT repeated here — `Song.__post_init__` does
+    them. This function only handles what is specific to reading a CSV: turning
+    strings into numbers. Each rule lives in exactly one place.
+    """
+    return Song(
+        id=int(_to_number(row["id"], "id", whole=True)),
+        title=(row["title"] or "").strip(),
+        artist=(row["artist"] or "").strip(),
+        genre=(row["genre"] or "").strip(),
+        mood=(row["mood"] or "").strip(),
+        energy=_to_number(row["energy"], "energy"),
+        tempo_bpm=_to_number(row["tempo_bpm"], "tempo_bpm"),
+        valence=_to_number(row["valence"], "valence"),
+        danceability=_to_number(row["danceability"], "danceability"),
+        acousticness=_to_number(row["acousticness"], "acousticness"),
+    )
+
+
+def _read_rows(csv_path: str) -> Iterator[Tuple[int, Dict[str, str]]]:
+    """Yield (file line number, row) pairs, after checking the header.
+
+    Line numbers start at 2 because line 1 is the header. Reporting them lets an
+    error message point at the exact line to open in a spreadsheet.
+    """
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            header = reader.fieldnames or []
+            missing = [column for column in REQUIRED_COLUMNS if column not in header]
+            if missing:
+                raise CatalogError(
+                    f"{csv_path}: missing required column(s): {', '.join(missing)}. "
+                    f"Found: {', '.join(header) if header else '(no header row)'}"
+                )
+            for line_number, row in enumerate(reader, start=2):
+                yield line_number, row
+    except FileNotFoundError:
+        raise CatalogError(f"catalog file not found: {csv_path}") from None
+
+
 def load_songs(csv_path: str) -> List[Song]:
-    """Read the song catalog from a CSV file into a list of Song objects.
+    """Read and validate the song catalog, returning a list of Song objects.
 
-    A CSV stores everything as text: the file literally contains the characters
-    "0", ".", "8", "2". We convert the numeric columns to real numbers here, at
-    the boundary where data enters the system, so the rest of the code can do
-    arithmetic without worrying about types.
+    Bad data is never silently accepted. Every problem found is collected and
+    reported together in a single CatalogError, rather than raising on the first
+    one — so you fix your CSV in one pass instead of re-running once per typo.
 
-    Each field is now named explicitly rather than looped over generically. That
-    is slightly more typing, but it means the loader must satisfy the schema
-    declared on `Song` — a column renamed in the CSV fails here, at load time,
-    instead of producing a confusing error deep inside scoring.
+    Raises:
+        CatalogError: the file is missing, lacks required columns, is empty, has
+            duplicate IDs, or contains one or more invalid rows.
     """
     songs: List[Song] = []
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            songs.append(
-                Song(
-                    id=int(row["id"]),
-                    title=row["title"],
-                    artist=row["artist"],
-                    genre=row["genre"],
-                    mood=row["mood"],
-                    energy=float(row["energy"]),
-                    tempo_bpm=float(row["tempo_bpm"]),
-                    valence=float(row["valence"]),
-                    danceability=float(row["danceability"]),
-                    acousticness=float(row["acousticness"]),
-                )
-            )
+    problems: List[str] = []
+
+    for line_number, row in _read_rows(csv_path):
+        try:
+            songs.append(_song_from_row(row))
+        except InvalidSongError as error:
+            problems.append(f"line {line_number}: {error}")
+
+    problems.extend(_duplicate_id_problems(songs))
+
+    if problems:
+        summary = "\n  ".join(problems)
+        raise CatalogError(
+            f"{csv_path}: found {len(problems)} problem(s):\n  {summary}"
+        )
+
+    if not songs:
+        raise CatalogError(f"{csv_path}: catalog is empty (header only, no song rows)")
+
     return songs
+
+
+def _duplicate_id_problems(songs: List[Song]) -> List[str]:
+    """Report any ID used by more than one song.
+
+    A single Song cannot detect this — it only sees itself. Uniqueness is a
+    property of the collection, which is why this check lives in the loader
+    rather than in `Song.__post_init__`.
+    """
+    seen: Dict[int, str] = {}
+    problems: List[str] = []
+    for song in songs:
+        if song.id in seen:
+            problems.append(
+                f"duplicate id {song.id}: {song.title!r} reuses the id of {seen[song.id]!r}"
+            )
+        else:
+            seen[song.id] = song.title
+    return problems
 
 
 def score_song(

@@ -25,8 +25,10 @@ from pathlib import Path
 
 import pytest
 
+from src.exceptions import CatalogError, InvalidSongError, VibeFlowError
 from src.recommender import (
     DEFAULT_WEIGHTS,
+    REQUIRED_COLUMNS,
     Recommender,
     ScoringWeights,
     Song,
@@ -35,6 +37,22 @@ from src.recommender import (
     recommend_songs,
     score_song,
 )
+
+CSV_HEADER = ",".join(REQUIRED_COLUMNS)
+VALID_ROW = "1,Sunrise City,Neon Echo,pop,happy,0.82,118,0.84,0.79,0.18"
+SECOND_VALID_ROW = "2,Library Rain,Paper Lanterns,lofi,chill,0.35,72,0.60,0.58,0.86"
+
+
+def write_csv(tmp_path, *rows: str, header: str = CSV_HEADER) -> str:
+    """Write a throwaway CSV for failure tests and return its path.
+
+    `tmp_path` is a pytest fixture giving each test its own empty directory,
+    cleaned up automatically. It lets us test bad data without ever touching the
+    real data/songs.csv.
+    """
+    path = tmp_path / "songs.csv"
+    path.write_text("\n".join([header, *rows]) + "\n", encoding="utf-8")
+    return str(path)
 
 # Build the CSV path from this file's location rather than hard-coding
 # "data/songs.csv". That relative string only works if pytest happens to be run
@@ -356,37 +374,30 @@ def test_score_song_acoustic_preference_rewards_agreement_both_ways(by_title):
     assert score_song(UserProfile(likes_acoustic=False), acoustic)[0] == pytest.approx(0.0)
 
 
-def test_score_song_currently_allows_negative_scores_KNOWN_DEFECT():
-    """KNOWN DEFECT: out-of-range data produces a nonsense negative score.
+def test_out_of_range_energy_is_now_rejected_FORMERLY_KNOWN_DEFECT():
+    """This replaces a KNOWN_DEFECT test. The defect is fixed.
 
-    The energy term is 2.0 * (1 - |song - target|). That formula only behaves if
-    both values sit inside 0.0-1.0. Feed it energy=5.0 and it returns -8.0, plus
-    the malformed explanation text '(+-8.00)'. No exception is raised, so a
-    single CSV typo would corrupt rankings silently.
+    Previously Song(energy=5.0) was constructible, and scoring it returned -8.0
+    with the malformed explanation '(+-8.00)' — no exception, no warning. A
+    single CSV typo could corrupt every ranking silently.
 
-    Note that the Song dataclass happily accepts energy=5.0: type hints are
-    documentation, not enforcement. Python does not validate them at runtime.
-
-    We pin it here so the bug is documented. When we add validation, this test
-    should be REPLACED by one asserting a clear error is raised.
+    Now the bad state cannot exist: Song validates its own invariants in
+    __post_init__, so there is no way to reach the scorer with energy=5.0. The
+    old test asserted the broken behavior; this one asserts the guard.
     """
-    broken = Song(
-        id=999,
-        title="Out Of Range",
-        artist="Bad Data",
-        genre="pop",
-        mood="happy",
-        energy=5.0,
-        tempo_bpm=120.0,
-        valence=0.5,
-        danceability=0.5,
-        acousticness=0.5,
-    )
-
-    score, reasons = score_song(UserProfile(target_energy=0.0), broken)
-
-    assert score == pytest.approx(-8.0)
-    assert "(+-8.00)" in reasons[0]
+    with pytest.raises(InvalidSongError, match="energy must be between 0.0 and 1.0"):
+        Song(
+            id=999,
+            title="Out Of Range",
+            artist="Bad Data",
+            genre="pop",
+            mood="happy",
+            energy=5.0,
+            tempo_bpm=120.0,
+            valence=0.5,
+            danceability=0.5,
+            acousticness=0.5,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -689,3 +700,278 @@ def test_model_card_weight_experiment_changes_scores_but_not_order(catalog):
     experiment_top, _ = score_song(POP_PROFILE, catalog[0], experiment)
     assert default_top == pytest.approx(6.84)
     assert experiment_top == pytest.approx(7.68)
+
+
+# --------------------------------------------------------------------------
+# Song validation: a Song cannot exist in an invalid state
+# --------------------------------------------------------------------------
+
+def valid_song_kwargs(**overrides):
+    """A complete set of valid Song arguments, with selected fields replaced.
+
+    Lets each test change exactly one field to something bad, so the failure it
+    triggers is unambiguous.
+    """
+    kwargs = dict(
+        id=1,
+        title="Test Track",
+        artist="Test Artist",
+        genre="pop",
+        mood="happy",
+        energy=0.5,
+        tempo_bpm=120.0,
+        valence=0.5,
+        danceability=0.5,
+        acousticness=0.5,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+@pytest.mark.parametrize("field", ["energy", "valence", "danceability", "acousticness"])
+def test_song_rejects_proportions_above_one(field):
+    """All four 0.0-1.0 fields are range-checked, not just energy.
+
+    Parametrize runs this once per field and reports each as its own test, so a
+    failure names the offending field instead of hiding inside a loop.
+    """
+    with pytest.raises(InvalidSongError, match=f"{field} must be between 0.0 and 1.0"):
+        Song(**valid_song_kwargs(**{field: 1.5}))
+
+
+@pytest.mark.parametrize("field", ["energy", "valence", "danceability", "acousticness"])
+def test_song_rejects_negative_proportions(field):
+    with pytest.raises(InvalidSongError, match=f"{field} must be between 0.0 and 1.0"):
+        Song(**valid_song_kwargs(**{field: -0.1}))
+
+
+@pytest.mark.parametrize("boundary", [0.0, 1.0])
+def test_song_accepts_the_range_boundaries(boundary):
+    """0.0 and 1.0 are valid. The check is inclusive on both ends.
+
+    Boundary values are where off-by-one errors live, so they get their own test.
+    'Spacewalk Thoughts' style ambient tracks sit near 0, and 'Iron Verdict'
+    style tracks sit near 1, so both ends are real data, not hypothetical.
+    """
+    song = Song(**valid_song_kwargs(energy=boundary, acousticness=boundary))
+    assert song.energy == pytest.approx(boundary)
+
+
+@pytest.mark.parametrize("field", ["title", "artist", "genre", "mood"])
+@pytest.mark.parametrize("bad_value", ["", "   "])
+def test_song_rejects_blank_text_fields(field, bad_value):
+    """Empty and whitespace-only strings are both rejected.
+
+    A song titled "   " is as useless as one titled "", but a plain `if not
+    value` check would accept the spaces. `.strip()` is what catches it.
+    """
+    with pytest.raises(InvalidSongError, match=f"{field} must be a non-empty string"):
+        Song(**valid_song_kwargs(**{field: bad_value}))
+
+
+@pytest.mark.parametrize("bad_tempo", [0, -120.0])
+def test_song_rejects_non_positive_tempo(bad_tempo):
+    """A song at 0 BPM is not a song. Tempo must be strictly greater than 0."""
+    with pytest.raises(InvalidSongError, match="tempo_bpm must be greater than 0"):
+        Song(**valid_song_kwargs(tempo_bpm=bad_tempo))
+
+
+def test_song_rejects_non_numeric_values():
+    """Type hints are documentation, not enforcement.
+
+    `energy: float` does not stop Python assigning the string "loud". Only an
+    explicit runtime check does, which is the whole reason __post_init__ exists.
+    """
+    with pytest.raises(InvalidSongError, match="energy must be a number"):
+        Song(**valid_song_kwargs(energy="loud"))
+
+
+def test_song_rejects_booleans_where_numbers_belong():
+    """In Python, `True` IS `1` and `isinstance(True, int)` is True.
+
+    So a naive numeric check would silently accept energy=True as energy=1.0.
+    The validator explicitly excludes bool to close that hole.
+    """
+    with pytest.raises(InvalidSongError, match="energy must be a number"):
+        Song(**valid_song_kwargs(energy=True))
+
+
+def test_song_reports_every_problem_at_once():
+    """One error message lists all the problems, not just the first.
+
+    Fixing bad data one error per run is miserable. Aggregating means you see the
+    whole picture in a single pass.
+    """
+    with pytest.raises(InvalidSongError) as caught:
+        Song(**valid_song_kwargs(title="", energy=9.0, tempo_bpm=-5))
+
+    message = str(caught.value)
+    assert "title must be a non-empty string" in message
+    assert "energy must be between 0.0 and 1.0" in message
+    assert "tempo_bpm must be greater than 0" in message
+
+
+def test_user_profile_rejects_target_energy_outside_range():
+    """Both sides of the energy comparison must be in range.
+
+    Validating songs alone would not close the negative-score hole: a target of
+    5.0 against a perfectly valid song still gives 2.0 * (1 - 4.5) = -7.0.
+    """
+    with pytest.raises(InvalidSongError, match="target_energy must be between 0.0 and 1.0"):
+        UserProfile(target_energy=5.0)
+
+
+def test_user_profile_allows_an_unstated_target_energy():
+    """None is still valid — it means "the listener did not say"."""
+    assert UserProfile().target_energy is None
+
+
+# --------------------------------------------------------------------------
+# Catalog validation: failure modes of load_songs
+# --------------------------------------------------------------------------
+
+def test_the_real_catalog_passes_validation(catalog):
+    """The shipped data file is valid under all the new rules.
+
+    Worth asserting explicitly: it would be embarrassing to add validation that
+    rejects our own data.
+    """
+    assert len(catalog) == 19
+
+
+def test_load_songs_reports_a_missing_file():
+    """A missing catalog gives a clear message, not a raw FileNotFoundError."""
+    with pytest.raises(CatalogError, match="catalog file not found"):
+        load_songs("data/does_not_exist.csv")
+
+
+def test_load_songs_reports_missing_columns(tmp_path):
+    """A renamed or dropped column fails at load time, naming what is missing.
+
+    Previously this produced `KeyError: 'energy'` from deep inside the parse
+    loop, which does not tell you the CSV header is wrong.
+    """
+    header = "id,title,artist,genre,mood"  # missing five numeric columns
+    path = write_csv(tmp_path, "1,Song,Artist,pop,happy", header=header)
+
+    with pytest.raises(CatalogError, match="missing required column"):
+        load_songs(path)
+
+
+def test_missing_column_error_names_every_absent_column(tmp_path):
+    header = "id,title,artist,genre,mood,energy,tempo_bpm,valence,danceability"
+    path = write_csv(tmp_path, "1,Song,Artist,pop,happy,0.5,120,0.5,0.5", header=header)
+
+    with pytest.raises(CatalogError) as caught:
+        load_songs(path)
+
+    assert "acousticness" in str(caught.value)
+
+
+def test_load_songs_reports_an_empty_catalog(tmp_path):
+    """A header with no rows is an error, not an empty recommendation list.
+
+    Returning [] would make the app print 'Loaded songs: 0' and then silently
+    recommend nothing, which looks like a logic bug rather than a data problem.
+    """
+    path = write_csv(tmp_path)
+
+    with pytest.raises(CatalogError, match="catalog is empty"):
+        load_songs(path)
+
+
+def test_load_songs_reports_duplicate_ids(tmp_path):
+    """Uniqueness is a property of the collection, so the loader checks it.
+
+    A single Song cannot detect this — it only ever sees itself.
+    """
+    duplicate = "1,Different Song,Other Artist,rock,intense,0.9,150,0.4,0.6,0.1"
+    path = write_csv(tmp_path, VALID_ROW, duplicate)
+
+    with pytest.raises(CatalogError, match="duplicate id 1"):
+        load_songs(path)
+
+
+def test_load_songs_reports_the_line_number_of_a_bad_row(tmp_path):
+    """Errors point at the exact file line, so you can open it and fix it.
+
+    Line 3 here: line 1 is the header, line 2 is the good row.
+    """
+    bad = "3,Broken,Artist,pop,happy,NOT_A_NUMBER,120,0.5,0.5,0.5"
+    path = write_csv(tmp_path, VALID_ROW, bad)
+
+    with pytest.raises(CatalogError) as caught:
+        load_songs(path)
+
+    message = str(caught.value)
+    assert "line 3" in message
+    assert "energy must be a number" in message
+
+
+def test_load_songs_reports_out_of_range_values_with_context(tmp_path):
+    bad = "3,Too Loud,Artist,pop,happy,5.0,120,0.5,0.5,0.5"
+    path = write_csv(tmp_path, VALID_ROW, bad)
+
+    with pytest.raises(CatalogError, match="energy must be between 0.0 and 1.0"):
+        load_songs(path)
+
+
+def test_load_songs_aggregates_problems_across_multiple_rows(tmp_path):
+    """Every bad row is reported in one error, with a count.
+
+    This is the payoff of collecting instead of failing fast: three typos take
+    one run to find, not three.
+    """
+    path = write_csv(
+        tmp_path,
+        VALID_ROW,
+        "3,Bad Energy,Artist,pop,happy,5.0,120,0.5,0.5,0.5",
+        "4,,Artist,pop,happy,0.5,120,0.5,0.5,0.5",
+        "5,Bad Tempo,Artist,pop,happy,0.5,0,0.5,0.5,0.5",
+    )
+
+    with pytest.raises(CatalogError) as caught:
+        load_songs(path)
+
+    message = str(caught.value)
+    assert "found 3 problem(s)" in message
+    assert "line 3" in message and "line 4" in message and "line 5" in message
+
+
+def test_load_songs_accepts_extra_columns(tmp_path):
+    """Unknown columns are ignored rather than rejected.
+
+    This lets the data file carry notes or future fields without breaking the
+    loader — useful when the schema grows in Module 2.
+    """
+    header = CSV_HEADER + ",notes"
+    path = write_csv(tmp_path, VALID_ROW + ",added for testing", header=header)
+
+    songs = load_songs(path)
+
+    assert len(songs) == 1
+    assert songs[0].title == "Sunrise City"
+
+
+def test_load_songs_strips_surrounding_whitespace(tmp_path):
+    """Stray spaces in a hand-edited CSV should not become part of a title."""
+    padded = "1,  Sunrise City  ,  Neon Echo  ,pop,happy,0.82,118,0.84,0.79,0.18"
+    path = write_csv(tmp_path, padded)
+
+    song = load_songs(path)[0]
+
+    assert song.title == "Sunrise City"
+    assert song.artist == "Neon Echo"
+
+
+def test_catalog_errors_share_a_common_base():
+    """Both error types inherit VibeFlowError, so one handler can catch either.
+
+    This is what lets a future Streamlit app show a friendly message for any
+    expected failure while still letting real programming bugs crash loudly.
+    """
+    assert issubclass(CatalogError, VibeFlowError)
+    assert issubclass(InvalidSongError, VibeFlowError)
+
+    with pytest.raises(VibeFlowError):
+        load_songs("data/does_not_exist.csv")
