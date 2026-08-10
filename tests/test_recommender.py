@@ -220,10 +220,12 @@ def test_load_songs_converts_text_to_numbers(by_title):
 
 
 def test_load_songs_preserves_csv_order(catalog):
-    """Row order is preserved. This matters more than it looks.
+    """Rows come back in file order.
 
-    Python's sort is 'stable': items with equal scores keep their original
-    relative order. So today the CSV order silently acts as our tie-breaker.
+    This used to matter for ranking, because Python's stable sort meant CSV
+    order silently decided ties. It no longer does — `_ranking_key` spells the
+    tie-breakers out explicitly — but the loader should still hand back the file
+    as written, so a reader can line results up against the spreadsheet.
     """
     assert catalog[0].title == "Sunrise City"
     assert catalog[-1].title == "Dust Road Home"
@@ -468,20 +470,21 @@ def test_recommend_songs_explanation_matches_score_reasons(catalog, by_title):
     assert explanation == "; ".join(reasons)
 
 
-def test_ties_are_currently_broken_by_float_noise_KNOWN_DEFECT(catalog):
-    """KNOWN DEFECT: tied songs are ordered by floating-point rounding.
+def test_float_noise_no_longer_decides_ties_FORMERLY_KNOWN_DEFECT(catalog):
+    """This replaces a KNOWN_DEFECT test. The defect is fixed.
 
-    For the rock profile, two songs both display 1.84:
+    For the rock profile two songs both display 1.84, but their raw floats differ:
 
         Sunrise City -> 1.8399999999999999
         Iron Verdict -> 1.84
 
-    Both come from 2.0 * (1 - 0.08), but |0.82-0.9| and |0.98-0.9| land on
-    different binary floats. So Iron Verdict wins by a difference in the 16th
-    decimal place — an ordering no user could ever be given a reason for.
+    Both come from 2.0 * (1 - 0.08); |0.82-0.9| and |0.98-0.9| simply land on
+    different binary floats. Previously Iron Verdict won on that 16th-decimal
+    difference — an ordering no user could be given a reason for.
 
-    Reproducible, but arbitrary. When we add real tie-breaking rules this test
-    should fail and be replaced.
+    Now rounding makes them genuinely tied on score AND on energy gap, so the
+    ladder falls through to danceability, where Sunrise City (0.79) beats Iron
+    Verdict (0.45). The order flipped, and the new order has an explanation.
     """
     rock_profile = UserProfile(
         favorite_genre="rock", favorite_mood="intense", target_energy=0.9
@@ -489,7 +492,7 @@ def test_ties_are_currently_broken_by_float_noise_KNOWN_DEFECT(catalog):
     ranked = recommend_songs(rock_profile, catalog, k=19)
     titles = [song.title for song, _, _ in ranked]
 
-    assert titles.index("Iron Verdict") < titles.index("Sunrise City")
+    assert titles.index("Sunrise City") < titles.index("Iron Verdict")
 
 
 # --------------------------------------------------------------------------
@@ -975,3 +978,140 @@ def test_catalog_errors_share_a_common_base():
 
     with pytest.raises(VibeFlowError):
         load_songs("data/does_not_exist.csv")
+
+
+# --------------------------------------------------------------------------
+# Deterministic tie-breaking: every rung of the ladder
+# --------------------------------------------------------------------------
+
+# A weighting that isolates one rule at a time. Turning mood and acoustic off
+# makes it easy to build songs that tie on score for a known reason.
+TIE_WEIGHTS = ScoringWeights(
+    mood_match=0.0, genre_match=1.0, energy_match=2.0, acoustic_match=0.0
+)
+
+
+def tie_song(song_id: int, title: str, **overrides) -> Song:
+    """A song with neutral values, so each test varies only what it cares about."""
+    return Song(**valid_song_kwargs(id=song_id, title=title, **overrides))
+
+
+def ranked_titles(user, songs, weights=TIE_WEIGHTS):
+    return [song.title for song, _, _ in recommend_songs(user, songs, len(songs), weights)]
+
+
+def test_rung_one_higher_score_always_wins():
+    """Score dominates. No later rule can promote a lower-scoring song.
+
+    'Loser' has better danceability and an alphabetically earlier title, which
+    would win rules 3 and 4 — but it never gets that far, because rule 1 settles
+    it first.
+    """
+    user = UserProfile(favorite_genre="pop", target_energy=0.5)
+    winner = tie_song(1, "Zebra Winner", genre="pop", energy=0.5, danceability=0.1)
+    loser = tie_song(2, "Apple Loser", genre="rock", energy=0.5, danceability=0.9)
+
+    assert ranked_titles(user, [loser, winner]) == ["Zebra Winner", "Apple Loser"]
+
+
+def test_rung_two_closest_energy_breaks_a_score_tie():
+    """Equal scores, different distance from the target: closest wins.
+
+    Both songs total 2.0 by different routes — one earns a genre point and loses
+    energy points, the other has no genre match but sits exactly on target. Rule
+    2 prefers the one that actually matches the requested energy.
+    """
+    user = UserProfile(favorite_genre="pop", target_energy=0.5)
+    far = tie_song(1, "Far But Pop", genre="pop", energy=0.0)  # 1.0 + 1.0 = 2.0
+    near = tie_song(2, "On Target", genre="rock", energy=0.5)  # 0.0 + 2.0 = 2.0
+
+    scores = [s for _, s, _ in recommend_songs(user, [far, near], 2, TIE_WEIGHTS)]
+    assert scores[0] == pytest.approx(scores[1])  # genuinely tied on rule 1
+    assert ranked_titles(user, [far, near]) == ["On Target", "Far But Pop"]
+
+
+def test_rung_three_danceability_breaks_a_score_and_energy_tie():
+    """Same score, same energy gap: the more danceable song wins."""
+    user = UserProfile(target_energy=0.5)
+    dull = tie_song(1, "Aardvark Dull", energy=0.5, danceability=0.2)
+    lively = tie_song(2, "Zulu Lively", energy=0.5, danceability=0.9)
+
+    assert ranked_titles(user, [dull, lively]) == ["Zulu Lively", "Aardvark Dull"]
+
+
+def test_rung_four_alphabetical_title_breaks_remaining_ties():
+    """Identical on every numeric rule: fall back to title order, A first.
+
+    Note this rung is NOT negated in the key. Alphabetical means smaller-first,
+    which is already what ascending sort does — the reason the key tuple negates
+    scores instead of using reverse=True.
+    """
+    user = UserProfile(target_energy=0.5)
+    zebra = tie_song(1, "Zebra", energy=0.5, danceability=0.5)
+    apple = tie_song(2, "Apple", energy=0.5, danceability=0.5)
+
+    assert ranked_titles(user, [zebra, apple]) == ["Apple", "Zebra"]
+
+
+def test_alphabetical_tie_break_ignores_capitalisation():
+    """'apple' and 'Apple' should sort together, not with all capitals first.
+
+    Comparing raw strings would put every capitalised title ahead of every
+    lowercase one, because 'Z' < 'a' in character order. Lowercasing avoids that.
+    """
+    user = UserProfile(target_energy=0.5)
+    lower = tie_song(1, "apple pie", energy=0.5, danceability=0.5)
+    upper = tie_song(2, "Banana Bread", energy=0.5, danceability=0.5)
+
+    assert ranked_titles(user, [upper, lower]) == ["apple pie", "Banana Bread"]
+
+
+def test_rung_five_id_guarantees_a_total_order():
+    """Two songs identical in every rule including title: lowest id wins.
+
+    Without this last rung the order would depend on input order. The loader
+    rejects duplicate ids, so this rule can always settle the contest.
+    """
+    user = UserProfile(target_energy=0.5)
+    second = tie_song(2, "Same Title", energy=0.5, danceability=0.5)
+    first = tie_song(1, "Same Title", energy=0.5, danceability=0.5)
+
+    ranked = recommend_songs(user, [second, first], 2, TIE_WEIGHTS)
+    assert [song.id for song, _, _ in ranked] == [1, 2]
+
+
+def test_ranking_is_independent_of_catalog_order(catalog):
+    """THE POINT OF THIS STEP.
+
+    Shuffling the input must not change the output. Previously it could: ties
+    were settled by whichever song appeared first in the CSV, because Python's
+    stable sort preserves input order for equal keys. Reordering data/songs.csv
+    would silently reorder recommendations.
+
+    Now the ladder decides every position, so the ranking is a property of the
+    data and the profile — not of how the file happens to be sorted.
+    """
+    profile = UserProfile(
+        favorite_genre="rock", favorite_mood="intense", target_energy=0.9
+    )
+    expected = [s.title for s, _, _ in recommend_songs(profile, catalog, 19)]
+
+    reversed_catalog = list(reversed(catalog))
+    rotated_catalog = catalog[7:] + catalog[:7]
+
+    assert [s.title for s, _, _ in recommend_songs(profile, reversed_catalog, 19)] == expected
+    assert [s.title for s, _, _ in recommend_songs(profile, rotated_catalog, 19)] == expected
+
+
+def test_ranking_is_repeatable_across_calls(catalog):
+    """The same inputs always give the same answer.
+
+    Determinism is what makes the evaluation scenarios in Module 4 meaningful: a
+    metric that changes between runs measures nothing.
+    """
+    profile = UserProfile(favorite_genre="pop", favorite_mood="happy", target_energy=0.9)
+
+    first = [s.title for s, _, _ in recommend_songs(profile, catalog, 19)]
+    second = [s.title for s, _, _ in recommend_songs(profile, catalog, 19)]
+
+    assert first == second

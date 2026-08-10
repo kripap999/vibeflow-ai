@@ -366,6 +366,54 @@ def score_song(
     return score, reasons
 
 
+# How many decimal places to keep when deciding whether two numbers are "equal"
+# for ranking purposes. Floating-point noise from arithmetic like
+# 2.0 * (1 - abs(0.82 - 0.9)) lands around the 16th decimal place, so rounding at
+# 6 erases the noise while preserving any difference a listener could care about
+# (scores are displayed to 2 decimals).
+TIE_BREAK_PRECISION = 6
+
+
+def _ranking_key(song: Song, score: float, user: UserProfile) -> Tuple:
+    """Build the sort key that decides a song's position, ties included.
+
+    Python sorts tuples element by element: it compares the first items, and only
+    looks at the second if the first are equal. That makes a tuple a natural way
+    to express "rank by this, break ties with that, then that".
+
+    Every element here is written so that SMALLER WINS, which lets us sort in
+    plain ascending order. Values where bigger is better are negated. Mixing
+    directions is exactly what `reverse=True` cannot express, since it would flip
+    the alphabetical rule too.
+
+    The ladder, in order:
+
+        1. score            highest first          (negated)
+        2. energy gap       closest to target first
+        3. danceability     highest first          (negated)
+        4. title            alphabetical, case-insensitive
+        5. id               guarantees a total order; ids are unique
+
+    Rounding matters. Without it, 1.84 and 1.8399999999999999 count as different
+    scores and rule 1 settles the contest on floating-point noise — an ordering
+    no user could ever be given a reason for. Rounding makes them genuinely tied
+    so a rule with a real explanation gets its turn.
+
+    Rule 5 exists so the result is never ambiguous. Two songs could in principle
+    share a title; ids cannot collide, because the loader rejects duplicates.
+    """
+    energy_gap = (
+        abs(song.energy - user.target_energy) if user.target_energy is not None else 0.0
+    )
+    return (
+        -round(score, TIE_BREAK_PRECISION),
+        round(energy_gap, TIE_BREAK_PRECISION),
+        -round(song.danceability, TIE_BREAK_PRECISION),
+        song.title.lower(),
+        song.id,
+    )
+
+
 def recommend_songs(
     user: UserProfile,
     songs: List[Song],
@@ -377,9 +425,12 @@ def recommend_songs(
     This is the one and only ranking implementation. Scoring grades a single
     song; ranking is what turns those grades into a recommendation.
 
-    `sorted`/`.sort()` build a new list, so the caller's `songs` list is never
-    reordered. Python's sort is *stable*: songs with equal scores keep their
-    original catalog order, which is currently our only tie-breaker.
+    Ordering is fully deterministic: `_ranking_key` spells out an explicit
+    tie-breaker ladder, so the result never depends on catalog order or on
+    floating-point noise. See that function for the rules.
+
+    `.sort()` runs on a new list, so the caller's `songs` list is never
+    reordered.
     """
     scored: List[Tuple[Song, float, str]] = []
     for song in songs:
@@ -387,7 +438,8 @@ def recommend_songs(
         explanation = "; ".join(reasons) if reasons else "no strong matches"
         scored.append((song, score, explanation))
 
-    scored.sort(key=lambda item: item[1], reverse=True)  # item[1] is the score
+    # Ascending, with no reverse=True: the key already encodes every direction.
+    scored.sort(key=lambda item: _ranking_key(item[0], item[1], user))
     return scored[:k]
 
 
