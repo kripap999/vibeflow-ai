@@ -26,13 +26,10 @@ from pathlib import Path
 import pytest
 
 from src.exceptions import CatalogError, InvalidSongError, VibeFlowError
+from src.models import DEFAULT_WEIGHTS, ScoringWeights, Song, UserProfile
 from src.recommender import (
-    DEFAULT_WEIGHTS,
     REQUIRED_COLUMNS,
     Recommender,
-    ScoringWeights,
-    Song,
-    UserProfile,
     load_songs,
     recommend_songs,
     score_song,

@@ -8,7 +8,8 @@ Run from the repository root:
     python -m src.main
 """
 
-from src.recommender import UserProfile, load_songs, recommend_songs
+from src.models import UserProfile
+from src.recommender import load_songs, recommend_songs
 
 # A set of taste profiles used to stress-test the recommender.
 # The last one is "adversarial": high energy paired with a sad mood, which
